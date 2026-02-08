@@ -33,19 +33,24 @@ streamlit run job_dashboard.py
 
 The app provides:
 
-- source selection (`LinkedIn`, `Indeed`, `Naukri`, `RemoteOK`, `Remotive`, `Arbeitnow`)
+- source selection (`LinkedIn`, `Indeed`, `Naukri`, `RemoteOK`, `Remotive`, `Arbeitnow`, `Web Search (Company Careers)`)
 - progress/loading status for each provider
 - per-source health report (`success`, `empty`, `blocked`, `error`)
 - advanced filtering ("slice and dice"): text, source, company, location, date, remote, external apply links, employment type, dedupe, sorting
+- JD snippet visibility in result views
 - charts and CSV/JSON download
 - save filtered CSV directly to workspace
+- parallel provider execution for faster runs
+- short-lived in-memory query cache for near-instant repeated searches
+- mobile-friendly layout mode with compact cards
 
 ## Source notes
 
-- `LinkedIn`: public guest jobs pages; includes apply-link extraction where available.
+- `LinkedIn`: public guest jobs pages; includes apply-link extraction where available. (UI now defaults to skipping detail-page extraction for speed.)
 - `RemoteOK`, `Remotive`, `Arbeitnow`: public API-style sources.
 - `Indeed`: often protected by anti-bot/captcha. The app surfaces blocked status cleanly.
 - `Naukri`: tries API first; if captcha blocks API, the app falls back to indexed Naukri listing links.
+- `Web Search (Company Careers)`: searches the web for relevant career pages, visits discovered company sites, and extracts job postings by matching title/description and preserving company apply links plus JD snippets.
 
 ## CLI still available (LinkedIn CSV)
 

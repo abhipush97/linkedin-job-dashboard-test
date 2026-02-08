@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import html
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from time import perf_counter
+from threading import Lock
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
@@ -31,10 +34,11 @@ NAUKRI = "Naukri"
 REMOTEOK = "RemoteOK"
 REMOTIVE = "Remotive"
 ARBEITNOW = "Arbeitnow"
+WEB_COMPANY_CAREERS = "Web Search (Company Careers)"
 DUCKDUCKGO_HTML_ENDPOINT = "https://duckduckgo.com/html/"
 YAHOO_SEARCH_ENDPOINT = "https://search.yahoo.com/search"
 
-ALL_SOURCES = [LINKEDIN, INDEED, NAUKRI, REMOTEOK, REMOTIVE, ARBEITNOW]
+ALL_SOURCES = [LINKEDIN, INDEED, NAUKRI, REMOTEOK, REMOTIVE, ARBEITNOW, WEB_COMPANY_CAREERS]
 DEFAULT_UI_SOURCES = [LINKEDIN, REMOTEOK, REMOTIVE, ARBEITNOW]
 
 REMOTE_HINTS = (
@@ -46,6 +50,58 @@ REMOTE_HINTS = (
     "worldwide",
     "telecommute",
 )
+CAREER_LINK_HINTS = (
+    "career",
+    "careers",
+    "jobs",
+    "join-us",
+    "joinus",
+    "vacancies",
+    "openings",
+    "work-with-us",
+    "opportunities",
+)
+JOB_LINK_HINTS = (
+    "job",
+    "jobs",
+    "opening",
+    "openings",
+    "position",
+    "vacancy",
+    "opportunity",
+    "hiring",
+    "requisition",
+    "reqid",
+    "jobid",
+    "department",
+)
+IGNORED_WEB_HOST_MARKERS = (
+    "search.yahoo.com",
+    "r.search.yahoo.com",
+    "duckduckgo.com",
+    "linkedin.com",
+    "indeed.com",
+    "naukri.com",
+    "glassdoor.com",
+    "ziprecruiter.com",
+    "monster.com",
+    "simplyhired.com",
+    "youtube.com",
+    "facebook.com",
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "wikipedia.org",
+)
+SEARCH_CACHE_TTL_SECONDS = 300.0
+SEARCH_CACHE_MAX_ENTRIES = 20
+SEARCH_WORKERS = 6
+CAREER_CRAWL_WORKERS = 8
+_SEARCH_CACHE: dict[
+    tuple[object, ...],
+    tuple[float, list[UnifiedJob], list[SourceRunReport]],
+] = {}
+_SEARCH_CACHE_LOCK = Lock()
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -97,6 +153,10 @@ class SearchConfig:
     limit_per_source: int = 30
     linkedin_detail_delay: float = 0.35
     linkedin_skip_apply_url: bool = False
+    web_result_pages: int = 1
+    web_max_sites: int = 8
+    web_follow_links_per_site: int = 0
+    web_links_per_site: int = 4
 
 
 def clean_text(value: str | None) -> str:
@@ -215,8 +275,18 @@ def extract_yahoo_target(raw_url: str) -> str:
     if not resolved:
         return ""
 
+    parsed = urlparse(resolved)
+    query_params = parse_qs(parsed.query)
+    for key in ("RU", "ru", "u", "url"):
+        values = query_params.get(key, [])
+        if values:
+            return clean_text(unquote(values[0]))
+
     marker_start = "/RU="
     marker_end = "/RK="
+    if marker_start in parsed.path and marker_end in parsed.path:
+        encoded = parsed.path.split(marker_start, 1)[1].split(marker_end, 1)[0]
+        return clean_text(unquote(encoded))
     if marker_start in resolved and marker_end in resolved:
         encoded = resolved.split(marker_start, 1)[1].split(marker_end, 1)[0]
         return clean_text(unquote(encoded))
@@ -227,6 +297,526 @@ def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
     return session
+
+
+def canonicalize_web_url(raw_url: str) -> str:
+    parsed = urlparse(clean_text(raw_url))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+    return normalized.rstrip("/")
+
+
+def root_domain(hostname: str) -> str:
+    host = clean_text(hostname).lower().split(":")[0]
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def infer_company_name_from_url(target_url: str) -> str:
+    host = urlparse(target_url).netloc.lower()
+    host = host.removeprefix("www.")
+    core = host.split(":")[0]
+    if not core:
+        return ""
+    parts = [part for part in core.split(".") if part]
+    if len(parts) >= 2:
+        core = parts[-2]
+    return clean_text(core.replace("-", " ").replace("_", " ").title())
+
+
+def should_skip_web_result(target_url: str) -> bool:
+    parsed = urlparse(target_url)
+    host = parsed.netloc.lower()
+    if not host:
+        return True
+    if parsed.scheme not in {"http", "https"}:
+        return True
+    if any(marker in host for marker in IGNORED_WEB_HOST_MARKERS):
+        return True
+    if target_url.lower().endswith((".pdf", ".doc", ".docx")):
+        return True
+    return False
+
+
+def iter_jsonld_nodes(payload: object) -> list[dict[str, object]]:
+    nodes: list[dict[str, object]] = []
+    if isinstance(payload, dict):
+        nodes.append(payload)
+        graph = payload.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                nodes.extend(iter_jsonld_nodes(item))
+        elif isinstance(graph, dict):
+            nodes.extend(iter_jsonld_nodes(graph))
+        main_entity = payload.get("mainEntity")
+        if isinstance(main_entity, (list, dict)):
+            nodes.extend(iter_jsonld_nodes(main_entity))
+    elif isinstance(payload, list):
+        for item in payload:
+            nodes.extend(iter_jsonld_nodes(item))
+    return nodes
+
+
+def extract_jsonld_location(value: object) -> str:
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, list):
+        parts = [extract_jsonld_location(item) for item in value]
+        unique_parts = [part for part in parts if part]
+        return clean_text(" / ".join(unique_parts))
+    if not isinstance(value, dict):
+        return ""
+
+    if clean_text(str(value.get("jobLocationType"))).lower() == "telecommute":
+        return "Remote"
+
+    address = value.get("address")
+    if isinstance(address, str):
+        return clean_text(address)
+    if isinstance(address, dict):
+        fragments = [
+            clean_text(str(address.get("addressLocality") or "")),
+            clean_text(str(address.get("addressRegion") or "")),
+            clean_text(str(address.get("addressCountry") or "")),
+        ]
+        joined = ", ".join(fragment for fragment in fragments if fragment)
+        if joined:
+            return joined
+
+    name = clean_text(str(value.get("name") or ""))
+    if name:
+        return name
+    return ""
+
+
+def extract_jsonld_salary(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return clean_text(str(value))
+    if isinstance(value, str):
+        return clean_text(value)
+    if not isinstance(value, dict):
+        return ""
+
+    currency = clean_text(str(value.get("currency") or ""))
+    amount = value.get("value")
+    unit = ""
+    amount_text = ""
+    if isinstance(amount, dict):
+        min_value = clean_text(str(amount.get("minValue") or ""))
+        max_value = clean_text(str(amount.get("maxValue") or ""))
+        exact_value = clean_text(str(amount.get("value") or ""))
+        if min_value or max_value:
+            amount_text = f"{min_value}-{max_value}".strip("-")
+        else:
+            amount_text = exact_value
+        unit = clean_text(str(amount.get("unitText") or ""))
+    elif isinstance(amount, (int, float, str)):
+        amount_text = clean_text(str(amount))
+    parts = [part for part in (currency, amount_text, unit) if part]
+    return clean_text(" ".join(parts))
+
+
+def jsonld_type_contains_job_posting(value: object) -> bool:
+    if isinstance(value, str):
+        return clean_text(value).lower() == "jobposting"
+    if isinstance(value, list):
+        return any(jsonld_type_contains_job_posting(item) for item in value)
+    return False
+
+
+def parse_jobs_from_jsonld(
+    soup: BeautifulSoup,
+    *,
+    page_url: str,
+    fallback_company: str,
+    config: SearchConfig,
+    max_jobs: int,
+) -> list[UnifiedJob]:
+    collected: list[UnifiedJob] = []
+    seen: set[str] = set()
+
+    for script in soup.select("script[type='application/ld+json']"):
+        raw_json = script.string if script.string else script.get_text(" ", strip=True)
+        raw_json = raw_json.strip() if raw_json else ""
+        if not raw_json:
+            continue
+
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+
+        for node in iter_jsonld_nodes(payload):
+            if not jsonld_type_contains_job_posting(node.get("@type")):
+                continue
+
+            title = clean_text(str(node.get("title") or node.get("name") or ""))
+            description = strip_html(str(node.get("description") or ""))
+            hiring = node.get("hiringOrganization")
+            company = fallback_company
+            if isinstance(hiring, str):
+                company = clean_text(hiring) or company
+            elif isinstance(hiring, dict):
+                company = clean_text(str(hiring.get("name") or "")) or company
+
+            location = extract_jsonld_location(node.get("jobLocation"))
+            if not location and clean_text(str(node.get("jobLocationType") or "")).lower() == "telecommute":
+                location = "Remote"
+
+            listed_at = clean_text(str(node.get("datePosted") or node.get("validThrough") or ""))
+            listed_date = normalize_date(listed_at)
+            salary = extract_jsonld_salary(node.get("baseSalary"))
+            employment_type_raw = node.get("employmentType")
+            if isinstance(employment_type_raw, list):
+                employment_type = ", ".join(
+                    clean_text(str(item))
+                    for item in employment_type_raw
+                    if clean_text(str(item))
+                )
+            else:
+                employment_type = clean_text(str(employment_type_raw or ""))
+
+            job_url = to_absolute_url(clean_text(str(node.get("url") or "")), page_url)
+            if not job_url:
+                job_url = clean_text(page_url)
+            dedupe_key = canonicalize_web_url(job_url) or f"{title}|{company}|{location}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            blob = f"{title} {company} {location} {description}"
+            if not keyword_match(config.keywords, blob):
+                continue
+            if config.location and location and not location_match(config.location, blob):
+                continue
+
+            job_id = "career-" + hashlib.sha1(dedupe_key.encode("utf-8")).hexdigest()[:14]
+            collected.append(
+                UnifiedJob(
+                    source=WEB_COMPANY_CAREERS,
+                    keywords=config.keywords,
+                    title=title or "Job Opening",
+                    company=company,
+                    location=location or config.location,
+                    listed_at=listed_at,
+                    listed_date=listed_date,
+                    job_id=job_id,
+                    job_url=job_url,
+                    apply_url=job_url,
+                    employment_type=employment_type,
+                    salary=salary,
+                    is_remote=is_remote_label(location, title, description),
+                    description_snippet=description[:260],
+                )
+            )
+            if len(collected) >= max_jobs:
+                return collected
+
+    return collected
+
+
+def score_link_for_hints(anchor_text: str, target_url: str, hints: tuple[str, ...]) -> int:
+    parsed = urlparse(target_url)
+    signal_blob = f"{anchor_text} {parsed.path} {parsed.query}".lower()
+    return sum(hint in signal_blob for hint in hints)
+
+
+def extract_candidate_links(
+    soup: BeautifulSoup,
+    *,
+    page_url: str,
+    hints: tuple[str, ...],
+    max_links: int,
+) -> list[tuple[str, str, str]]:
+    base_host = urlparse(page_url).netloc.lower()
+    base_root = root_domain(base_host)
+    candidates: list[tuple[int, str, str, str]] = []
+    seen_urls: set[str] = set()
+
+    for anchor in soup.select("a[href]"):
+        href = to_absolute_url(clean_text(anchor.get("href")), page_url)
+        if not href:
+            continue
+        parsed = urlparse(href)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if base_root and base_root not in root_domain(parsed.netloc.lower()):
+            continue
+
+        canonical = canonicalize_web_url(href)
+        if not canonical or canonical in seen_urls:
+            continue
+        seen_urls.add(canonical)
+
+        anchor_text = clean_text(anchor.get_text(" ", strip=True))
+        if not anchor_text and not parsed.path:
+            continue
+
+        score = score_link_for_hints(anchor_text, href, hints)
+        if score <= 0:
+            continue
+
+        context_text = clean_text(anchor.parent.get_text(" ", strip=True) if anchor.parent else "")
+        candidates.append((score, anchor_text, href, context_text))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [(title, url, snippet) for _, title, url, snippet in candidates[:max_links]]
+
+
+def fetch_html_page(session: requests.Session, target_url: str) -> tuple[str, str]:
+    response = session.get(target_url, timeout=7, allow_redirects=True)
+    response.raise_for_status()
+    content_type = clean_text(response.headers.get("Content-Type", "")).lower()
+    if content_type and "html" not in content_type:
+        return "", clean_text(response.url or target_url)
+    return response.text, clean_text(response.url or target_url)
+
+
+def crawl_single_career_site(seed_url: str, config: SearchConfig) -> list[UnifiedJob]:
+    session = make_session()
+    visited_pages: set[str] = set()
+    collected: list[UnifiedJob] = []
+    seen_jobs: set[str] = set()
+    pages_to_visit: list[str] = [seed_url]
+
+    try:
+        while pages_to_visit and len(visited_pages) <= config.web_follow_links_per_site:
+            current_url = pages_to_visit.pop(0)
+            canonical_page = canonicalize_web_url(current_url)
+            if not canonical_page or canonical_page in visited_pages:
+                continue
+            visited_pages.add(canonical_page)
+
+            try:
+                page_html, resolved_url = fetch_html_page(session, current_url)
+            except requests.RequestException:
+                continue
+            if not page_html:
+                continue
+
+            soup = BeautifulSoup(page_html, "html.parser")
+            company = infer_company_name_from_url(resolved_url)
+            structured = parse_jobs_from_jsonld(
+                soup,
+                page_url=resolved_url,
+                fallback_company=company,
+                config=config,
+                max_jobs=config.web_links_per_site,
+            )
+
+            for job in structured:
+                dedupe_key = canonicalize_web_url(job.job_url) or job.job_id
+                if dedupe_key in seen_jobs:
+                    continue
+                seen_jobs.add(dedupe_key)
+                collected.append(job)
+                if len(collected) >= config.limit_per_source:
+                    return collected
+
+            if len(visited_pages) == 1:
+                career_links = extract_candidate_links(
+                    soup,
+                    page_url=resolved_url,
+                    hints=CAREER_LINK_HINTS,
+                    max_links=config.web_follow_links_per_site,
+                )
+                for _, career_url, _ in career_links:
+                    canonical_career = canonicalize_web_url(career_url)
+                    if canonical_career and canonical_career not in visited_pages:
+                        pages_to_visit.append(career_url)
+
+            if structured:
+                continue
+
+            fallback_links = extract_candidate_links(
+                soup,
+                page_url=resolved_url,
+                hints=JOB_LINK_HINTS,
+                max_links=config.web_links_per_site,
+            )
+            for title, job_url, snippet in fallback_links:
+                snippet_text = clean_text(snippet)[:260]
+                clean_title = clean_text(title) or "Job Opening"
+                fallback_company = company or infer_company_name_from_url(job_url)
+                blob = f"{clean_title} {fallback_company} {snippet_text}"
+                if not keyword_match(config.keywords, blob):
+                    continue
+
+                dedupe_key = canonicalize_web_url(job_url) or f"{clean_title}|{fallback_company}"
+                if dedupe_key in seen_jobs:
+                    continue
+                seen_jobs.add(dedupe_key)
+                job_id = "career-" + hashlib.sha1(dedupe_key.encode("utf-8")).hexdigest()[:14]
+                collected.append(
+                    UnifiedJob(
+                        source=WEB_COMPANY_CAREERS,
+                        keywords=config.keywords,
+                        title=clean_title,
+                        company=fallback_company,
+                        location=config.location or "",
+                        listed_at="",
+                        listed_date="",
+                        job_id=job_id,
+                        job_url=job_url,
+                        apply_url=job_url,
+                        employment_type="",
+                        salary="",
+                        is_remote=is_remote_label(config.location, clean_title, snippet_text),
+                        description_snippet=snippet_text,
+                    )
+                )
+                if len(collected) >= config.limit_per_source:
+                    return collected
+    finally:
+        session.close()
+
+    return collected
+
+
+def fetch_web_seed_urls(
+    config: SearchConfig,
+    session: requests.Session,
+) -> list[tuple[str, str, str]]:
+    pages = max(1, min(4, int(config.web_result_pages or 1)))
+    max_sites = max(4, int(config.web_max_sites or 16))
+    query = clean_text(f'{config.keywords} {config.location} "careers" "job openings"')
+
+    candidates: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+
+    def add_candidate(url: str, title: str = "", snippet: str = "") -> bool:
+        canonical = canonicalize_web_url(url)
+        if not canonical or canonical in seen_urls:
+            return False
+        if should_skip_web_result(url):
+            return False
+        seen_urls.add(canonical)
+        candidates.append((url, clean_text(title), clean_text(snippet)))
+        return len(candidates) >= max_sites
+
+    for page_index in range(pages):
+        try:
+            response = session.get(
+                YAHOO_SEARCH_ENDPOINT,
+                params={"p": query, "b": (page_index * 10) + 1},
+                timeout=14,
+                headers=DEFAULT_HEADERS,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        nodes = soup.select("div#web ol li") or soup.select("div#web li")
+        for node in nodes:
+            anchor = node.select_one("a")
+            if not anchor:
+                continue
+            target_url = extract_yahoo_target(clean_text(anchor.get("href")))
+            title = clean_text(anchor.get_text(" ", strip=True))
+            snippet_tag = node.select_one("p")
+            snippet = clean_text(snippet_tag.get_text(" ", strip=True) if snippet_tag else "")
+            if add_candidate(target_url, title, snippet):
+                return candidates
+        time.sleep(0.10)
+
+    for page_index in range(pages):
+        try:
+            response = session.get(
+                DUCKDUCKGO_HTML_ENDPOINT,
+                params={"q": query, "s": page_index * 30},
+                timeout=14,
+                headers=DEFAULT_HEADERS,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for node in soup.select("div.result"):
+            anchor = node.select_one("a.result__a")
+            if not anchor:
+                continue
+            target_url = extract_duckduckgo_target(clean_text(anchor.get("href")))
+            title = clean_text(anchor.get_text(" ", strip=True))
+            snippet_tag = node.select_one(".result__snippet")
+            snippet = clean_text(snippet_tag.get_text(" ", strip=True) if snippet_tag else "")
+            if add_candidate(target_url, title, snippet):
+                return candidates
+        time.sleep(0.10)
+
+    return candidates
+
+
+def fetch_web_company_jobs(config: SearchConfig, session: requests.Session) -> list[UnifiedJob]:
+    seed_rows = fetch_web_seed_urls(config, session)
+    if not seed_rows:
+        return []
+    seed_urls = [url for url, _, _ in seed_rows]
+    crawl_site_cap = max(4, min(len(seed_urls), int(config.limit_per_source) + 2))
+    seed_urls = seed_urls[:crawl_site_cap]
+
+    collected: list[UnifiedJob] = []
+    seen_jobs: set[str] = set()
+    workers = max(1, min(CAREER_CRAWL_WORKERS, len(seed_urls), max(2, int(config.limit_per_source))))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(crawl_single_career_site, url, config) for url in seed_urls]
+        for future in as_completed(futures):
+            try:
+                jobs = future.result()
+            except Exception:  # pylint: disable=broad-exception-caught
+                continue
+
+            for job in jobs:
+                dedupe_key = canonicalize_web_url(job.job_url) or job.job_id
+                if dedupe_key in seen_jobs:
+                    continue
+                seen_jobs.add(dedupe_key)
+                collected.append(job)
+                if len(collected) >= config.limit_per_source:
+                    return collected
+
+    # If direct crawling yields sparse data, preserve relevant search hits.
+    if len(collected) < config.limit_per_source:
+        for seed_url, seed_title, seed_snippet in seed_rows:
+            dedupe_key = canonicalize_web_url(seed_url) or seed_url
+            if dedupe_key in seen_jobs:
+                continue
+
+            company = infer_company_name_from_url(seed_url)
+            title = seed_title or "Career Page"
+            blob = f"{title} {company} {seed_snippet}"
+            if not keyword_match(config.keywords, blob):
+                continue
+
+            seen_jobs.add(dedupe_key)
+            job_id = "career-" + hashlib.sha1(dedupe_key.encode("utf-8")).hexdigest()[:14]
+            collected.append(
+                UnifiedJob(
+                    source=WEB_COMPANY_CAREERS,
+                    keywords=config.keywords,
+                    title=title,
+                    company=company,
+                    location=config.location or "",
+                    listed_at="",
+                    listed_date="",
+                    job_id=job_id,
+                    job_url=seed_url,
+                    apply_url=seed_url,
+                    employment_type="",
+                    salary="",
+                    is_remote=is_remote_label(config.location, title, seed_snippet),
+                    description_snippet=seed_snippet[:260],
+                )
+            )
+            if len(collected) >= config.limit_per_source:
+                break
+
+    return collected
 
 
 def fetch_linkedin_jobs(config: SearchConfig) -> list[UnifiedJob]:
@@ -785,7 +1375,88 @@ FETCHERS = {
     REMOTEOK: fetch_remoteok_jobs,
     REMOTIVE: fetch_remotive_jobs,
     ARBEITNOW: fetch_arbeitnow_jobs,
+    WEB_COMPANY_CAREERS: fetch_web_company_jobs,
 }
+
+
+def make_search_cache_key(config: SearchConfig, selected_sources: list[str]) -> tuple[object, ...]:
+    return (
+        clean_text(config.keywords).lower(),
+        clean_text(config.location).lower(),
+        tuple(selected_sources),
+        int(config.limit_per_source),
+        round(float(config.linkedin_detail_delay), 2),
+        bool(config.linkedin_skip_apply_url),
+        int(config.web_result_pages),
+        int(config.web_max_sites),
+        int(config.web_follow_links_per_site),
+        int(config.web_links_per_site),
+    )
+
+
+def get_cached_search_result(
+    cache_key: tuple[object, ...],
+) -> tuple[list[UnifiedJob], list[SourceRunReport]] | None:
+    with _SEARCH_CACHE_LOCK:
+        cached = _SEARCH_CACHE.get(cache_key)
+        if not cached:
+            return None
+        captured_at, jobs, reports = cached
+        if (time.time() - captured_at) > SEARCH_CACHE_TTL_SECONDS:
+            _SEARCH_CACHE.pop(cache_key, None)
+            return None
+        return list(jobs), list(reports)
+
+
+def set_cached_search_result(
+    cache_key: tuple[object, ...],
+    jobs: list[UnifiedJob],
+    reports: list[SourceRunReport],
+) -> None:
+    with _SEARCH_CACHE_LOCK:
+        _SEARCH_CACHE[cache_key] = (time.time(), list(jobs), list(reports))
+        if len(_SEARCH_CACHE) > SEARCH_CACHE_MAX_ENTRIES:
+            oldest_key = min(_SEARCH_CACHE.items(), key=lambda item: item[1][0])[0]
+            _SEARCH_CACHE.pop(oldest_key, None)
+
+
+def run_single_source(source: str, config: SearchConfig) -> tuple[str, list[UnifiedJob], SourceRunReport]:
+    started = perf_counter()
+    status = "success"
+    message = "ok"
+    jobs: list[UnifiedJob] = []
+    session = make_session()
+
+    try:
+        jobs = FETCHERS[source](config, session)
+        if len(jobs) == 0:
+            status = "empty"
+            message = "no matching jobs returned"
+        elif source == NAUKRI and all(str(job.job_id).startswith("fallback-") for job in jobs):
+            message = f"API blocked by captcha; fallback index returned {len(jobs)} job(s)"
+        else:
+            message = f"fetched {len(jobs)} job(s)"
+    except SourceBlockedError as exc:
+        status = "blocked"
+        message = str(exc)
+    except requests.RequestException as exc:
+        status = "error"
+        message = f"request failed: {exc}"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        status = "error"
+        message = f"unexpected error: {exc}"
+    finally:
+        session.close()
+
+    elapsed = perf_counter() - started
+    report = SourceRunReport(
+        source=source,
+        status=status,
+        jobs_fetched=len(jobs),
+        elapsed_seconds=elapsed,
+        message=message,
+    )
+    return source, jobs, report
 
 
 def run_multi_source_search(
@@ -796,54 +1467,47 @@ def run_multi_source_search(
     if not selected_sources:
         return [], []
 
-    session = make_session()
+    cache_key = make_search_cache_key(config, selected_sources)
+    cached = get_cached_search_result(cache_key)
+    if cached:
+        cached_jobs, cached_reports = cached
+        if progress_callback:
+            progress_callback(0, 1, "Using cached results")
+            progress_callback(1, 1, f"Loaded cached results: {len(cached_jobs)} jobs")
+        return cached_jobs, cached_reports
+
+    total = len(selected_sources)
+    source_jobs: dict[str, list[UnifiedJob]] = {}
+    source_reports: dict[str, SourceRunReport] = {}
+    completed = 0
+
+    if progress_callback:
+        progress_callback(0, total, f"Launching {total} source(s) in parallel")
+
+    workers = max(1, min(SEARCH_WORKERS, total))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_single_source, source, config) for source in selected_sources]
+        for future in as_completed(futures):
+            source, jobs, report = future.result()
+            source_jobs[source] = jobs
+            source_reports[source] = report
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, f"{source}: {report.message}")
+
     all_jobs: list[UnifiedJob] = []
     reports: list[SourceRunReport] = []
-    total = len(selected_sources)
-
-    for index, source in enumerate(selected_sources, start=1):
-        if progress_callback:
-            progress_callback(index - 1, total, f"{source}: starting")
-
-        started = perf_counter()
-        status = "success"
-        message = "ok"
-        jobs: list[UnifiedJob] = []
-
-        try:
-            jobs = FETCHERS[source](config, session)
-            if len(jobs) == 0:
-                status = "empty"
-                message = "no matching jobs returned"
-            elif source == NAUKRI and all(str(job.job_id).startswith("fallback-") for job in jobs):
-                message = (
-                    f"API blocked by captcha; fallback index returned {len(jobs)} job(s)"
-                )
-            else:
-                message = f"fetched {len(jobs)} job(s)"
-        except SourceBlockedError as exc:
-            status = "blocked"
-            message = str(exc)
-        except requests.RequestException as exc:
-            status = "error"
-            message = f"request failed: {exc}"
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            status = "error"
-            message = f"unexpected error: {exc}"
-
-        elapsed = perf_counter() - started
-        reports.append(
-            SourceRunReport(
-                source=source,
-                status=status,
-                jobs_fetched=len(jobs),
-                elapsed_seconds=elapsed,
-                message=message,
-            )
-        )
+    for source in selected_sources:
+        jobs = source_jobs.get(source, [])
+        report = source_reports.get(source)
         all_jobs.extend(jobs)
+        if report:
+            reports.append(report)
 
-        if progress_callback:
-            progress_callback(index, total, f"{source}: {message}")
-
+    set_cached_search_result(cache_key, all_jobs, reports)
     return all_jobs, reports
+
+
+def clear_search_cache() -> None:
+    with _SEARCH_CACHE_LOCK:
+        _SEARCH_CACHE.clear()

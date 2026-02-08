@@ -76,6 +76,24 @@ def inject_styles() -> None:
                 background: rgba(15, 23, 42, 0.45);
             }
         }
+        @media (max-width: 900px) {
+            .block-container {
+                padding-top: 0.8rem;
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+                padding-bottom: 1.5rem;
+            }
+            h1 {
+                font-size: 1.6rem !important;
+            }
+            .metric-chip {
+                font-size: 0.82rem;
+                padding: 0.45rem 0.55rem;
+            }
+            div[data-testid="stStatusWidget"] {
+                padding: 0.35rem;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -248,6 +266,37 @@ def render_reports(report_rows: list[dict[str, object]]) -> None:
     st.dataframe(report_df, use_container_width=True, hide_index=True)
 
 
+def render_mobile_cards(filtered: pd.DataFrame, max_cards: int = 150) -> None:
+    if filtered.empty:
+        st.info("No rows match current filters.")
+        return
+
+    st.caption(f"Showing {min(len(filtered), max_cards)} of {len(filtered)} jobs")
+    card_rows = filtered.head(max_cards).to_dict(orient="records")
+    for row in card_rows:
+        title = str(row.get("title", "")).strip() or "Job Opening"
+        company = str(row.get("company", "")).strip() or "Unknown Company"
+        source = str(row.get("source", "")).strip() or "Unknown Source"
+        location = str(row.get("location", "")).strip() or "Unknown Location"
+        listed = str(row.get("listed_date", "")).strip() or str(row.get("listed_at", "")).strip()
+        description = str(row.get("description_snippet", "")).strip()
+        apply_url = str(row.get("apply_url", "")).strip()
+        job_url = str(row.get("job_url", "")).strip()
+
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(f"{company} | {source}")
+            st.caption(location)
+            if listed:
+                st.caption(f"Listed: {listed}")
+        if description:
+            st.caption(description)
+        if apply_url:
+            st.markdown(f"[Apply on company site]({apply_url})")
+        if job_url and job_url != apply_url:
+            st.markdown(f"[View job description]({job_url})")
+
+
 def save_to_workspace(df: pd.DataFrame, path_text: str) -> tuple[bool, str]:
     try:
         target = Path(path_text).expanduser()
@@ -271,7 +320,7 @@ def main() -> None:
 
     st.title("Job Intelligence Dashboard")
     st.caption(
-        "Aggregate jobs from multiple boards, monitor source health, and slice/filter the results before exporting."
+        "Aggregate jobs from multiple boards and career sites, monitor source health, and slice/filter the results before exporting."
     )
 
     if "jobs_rows" not in st.session_state:
@@ -296,15 +345,51 @@ def main() -> None:
         with st.expander("LinkedIn Options", expanded=False):
             linkedin_skip_apply = st.checkbox(
                 "Skip LinkedIn detail-page apply extraction",
-                value=False,
+                value=True,
             )
             linkedin_delay = st.slider(
                 "LinkedIn detail delay (seconds)",
-                min_value=0.10,
+                min_value=0.00,
                 max_value=1.20,
-                value=0.35,
+                value=0.20,
                 step=0.05,
             )
+
+        with st.expander("Web Search (Company Careers) Options", expanded=False):
+            web_result_pages = st.slider(
+                "Search result pages",
+                min_value=1,
+                max_value=3,
+                value=1,
+                step=1,
+            )
+            web_max_sites = st.slider(
+                "Websites to crawl",
+                min_value=6,
+                max_value=36,
+                value=8,
+                step=2,
+            )
+            web_follow_links_per_site = st.slider(
+                "Career subpages per website",
+                min_value=0,
+                max_value=4,
+                value=0,
+                step=1,
+            )
+            web_links_per_site = st.slider(
+                "Jobs/links per website",
+                min_value=3,
+                max_value=20,
+                value=4,
+                step=1,
+            )
+
+        mobile_mode = st.checkbox(
+            "Mobile-friendly layout",
+            value=True,
+            help="Use compact filters and card-style results for smaller screens.",
+        )
 
         run_search = st.button("Run Search", type="primary", use_container_width=True)
 
@@ -323,6 +408,10 @@ def main() -> None:
             limit_per_source=limit_per_source,
             linkedin_detail_delay=linkedin_delay,
             linkedin_skip_apply_url=linkedin_skip_apply,
+            web_result_pages=web_result_pages,
+            web_max_sites=web_max_sites,
+            web_follow_links_per_site=web_follow_links_per_site,
+            web_links_per_site=web_links_per_site,
         )
 
         progress_bar = st.progress(0.0, text="Initializing search...")
@@ -359,29 +448,44 @@ def main() -> None:
         st.stop()
 
     st.subheader("Slice and Dice")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
+    source_defaults = sorted(df["source"].dropna().unique())
+    if mobile_mode:
         text_query = st.text_input("Text contains", value="")
-    with c2:
-        source_filter = st.multiselect("Source filter", options=sorted(df["source"].dropna().unique()), default=sorted(df["source"].dropna().unique()))
-    with c3:
+        source_filter = st.multiselect("Source filter", options=source_defaults, default=source_defaults)
         location_query = st.text_input("Location contains", value="")
-    with c4:
         company_query = st.text_input("Company contains", value="")
-
-    c5, c6, c7, c8 = st.columns(4)
-    with c5:
         remote_only = st.checkbox("Remote only", value=False)
-    with c6:
         external_apply_only = st.checkbox("External apply links only", value=False)
-    with c7:
         dedupe = st.checkbox("Dedupe similar postings", value=True)
-    with c8:
         sort_mode = st.selectbox(
             "Sort",
             options=["Newest listed", "Oldest listed", "Company A-Z", "Source A-Z"],
             index=0,
         )
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            text_query = st.text_input("Text contains", value="")
+        with c2:
+            source_filter = st.multiselect("Source filter", options=source_defaults, default=source_defaults)
+        with c3:
+            location_query = st.text_input("Location contains", value="")
+        with c4:
+            company_query = st.text_input("Company contains", value="")
+
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            remote_only = st.checkbox("Remote only", value=False)
+        with c6:
+            external_apply_only = st.checkbox("External apply links only", value=False)
+        with c7:
+            dedupe = st.checkbox("Dedupe similar postings", value=True)
+        with c8:
+            sort_mode = st.selectbox(
+                "Sort",
+                options=["Newest listed", "Oldest listed", "Company A-Z", "Source A-Z"],
+                index=0,
+            )
 
     available_types = sorted(
         {
@@ -390,14 +494,12 @@ def main() -> None:
             if str(value).strip()
         }
     )
-    c9, c10 = st.columns(2)
-    with c9:
+    if mobile_mode:
         employment_types = st.multiselect(
             "Employment type",
             options=available_types,
             default=[],
         )
-    with c10:
         date_candidates = df["listed_date_parsed"].dropna()
         if not date_candidates.empty:
             min_date = date_candidates.min().date()
@@ -412,6 +514,29 @@ def main() -> None:
         else:
             st.caption("No structured listing dates available in this result set.")
             date_start, date_end = None, None
+    else:
+        c9, c10 = st.columns(2)
+        with c9:
+            employment_types = st.multiselect(
+                "Employment type",
+                options=available_types,
+                default=[],
+            )
+        with c10:
+            date_candidates = df["listed_date_parsed"].dropna()
+            if not date_candidates.empty:
+                min_date = date_candidates.min().date()
+                max_date = date_candidates.max().date()
+                date_range = st.date_input("Listed between", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+                if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                    date_start, date_end = date_range[0], date_range[1]
+                elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
+                    date_start, date_end = date_range[0], date_range[0]
+                else:
+                    date_start, date_end = date_range, date_range
+            else:
+                st.caption("No structured listing dates available in this result set.")
+                date_start, date_end = None, None
 
     filtered = apply_filters(
         df,
@@ -432,15 +557,31 @@ def main() -> None:
     shown = len(filtered)
     companies = filtered["company"].nunique() if shown else 0
     sources = filtered["source"].nunique() if shown else 0
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Filtered Jobs", shown)
-    m2.metric("Total Pulled", total)
-    m3.metric("Companies", companies)
-    m4.metric("Sources", sources)
+    metric_cols = st.columns(2) if mobile_mode else st.columns(4)
+    metric_cols[0].metric("Filtered Jobs", shown)
+    metric_cols[1].metric("Total Pulled", total)
+    if mobile_mode:
+        metric_cols = st.columns(2)
+        metric_cols[0].metric("Companies", companies)
+        metric_cols[1].metric("Sources", sources)
+    else:
+        metric_cols[2].metric("Companies", companies)
+        metric_cols[3].metric("Sources", sources)
 
     table_tab, insights_tab, export_tab = st.tabs(["Jobs Table", "Insights", "Export"])
 
     with table_tab:
+        if mobile_mode:
+            result_view = st.radio(
+                "Result view",
+                options=["Mobile Cards", "Table"],
+                horizontal=True,
+            )
+            if result_view == "Mobile Cards":
+                render_mobile_cards(filtered)
+            else:
+                st.caption("Table view on mobile can require horizontal scrolling.")
+
         display_cols = [
             "source",
             "title",
@@ -449,19 +590,22 @@ def main() -> None:
             "employment_type",
             "salary",
             "listed_date",
+            "description_snippet",
             "job_url",
             "apply_url",
         ]
-        st.dataframe(
-            filtered[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "job_url": st.column_config.LinkColumn("Job URL"),
-                "apply_url": st.column_config.LinkColumn("Apply URL"),
-            },
-            height=560,
-        )
+        if (not mobile_mode) or (mobile_mode and result_view == "Table"):
+            st.dataframe(
+                filtered[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "description_snippet": st.column_config.TextColumn("JD Snippet", width="large"),
+                    "job_url": st.column_config.LinkColumn("Job URL"),
+                    "apply_url": st.column_config.LinkColumn("Apply URL"),
+                },
+                height=560,
+            )
 
     with insights_tab:
         if filtered.empty:
