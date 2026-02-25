@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 
 SEARCH_ENDPOINT = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 JOB_POSTING_ENDPOINT = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+MAX_GUEST_SEARCH_OFFSET = 1000
 
 
 DEFAULT_HEADERS = {
@@ -123,14 +124,26 @@ class LinkedInPublicJobsClient:
         start = 0
 
         while len(collected) < limit:
-            page_html = self._get(
-                SEARCH_ENDPOINT,
-                params={
-                    "keywords": keywords,
-                    "location": location,
-                    "start": start,
-                },
-            )
+            # LinkedIn guest search often rejects very deep offsets.
+            if start >= MAX_GUEST_SEARCH_OFFSET:
+                break
+
+            try:
+                page_html = self._get(
+                    SEARCH_ENDPOINT,
+                    params={
+                        "keywords": keywords,
+                        "location": location,
+                        "start": start,
+                    },
+                )
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                # Stop cleanly when pagination goes past guest endpoint limits.
+                if status_code == 400 and start > 0:
+                    break
+                raise
+
             soup = BeautifulSoup(page_html, "html.parser")
             cards = soup.select("div.base-card[data-entity-urn]")
             if not cards:
@@ -349,6 +362,11 @@ def main() -> int:
     count = write_csv(output_path, jobs)
 
     print(f"Wrote {count} job(s) to: {output_path}")
+    if args.limit > MAX_GUEST_SEARCH_OFFSET:
+        print(
+            "Note: LinkedIn guest search caps deep pagination; "
+            f"limits above ~{MAX_GUEST_SEARCH_OFFSET} may return fewer rows."
+        )
     if count == 0:
         print("No jobs were returned. Try broader keywords/location or run again later.")
     return 0

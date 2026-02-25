@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+import hmac
+import html
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -13,88 +15,309 @@ from job_sources import (
     run_multi_source_search,
 )
 
+DEFAULT_LOGIN_USERNAME = "recruiter"
+DEFAULT_LOGIN_PASSWORD = "linkedin123"
+
 
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Public+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
 
-        html, body, [class*="css"]  {
-            font-family: 'Space Grotesk', sans-serif;
+        :root {
+            --brand: #0a66c2;
+            --brand-strong: #004182;
+            --surface: #ffffff;
+            --surface-soft: #f3f6f9;
+            --line: #d5e3f1;
+            --text: #1d2226;
+            --muted: #536471;
         }
-        .metric-chip {
-            padding: 0.5rem 0.75rem;
-            border-radius: 0.6rem;
-            border: 1px solid rgba(71, 85, 105, 0.28);
-            background: rgba(241, 245, 249, 0.7);
-            font-size: 0.92rem;
-            color: inherit;
+
+        .stApp {
+            background:
+                radial-gradient(1200px 460px at -15% -20%, rgba(10, 102, 194, 0.16), transparent 62%),
+                radial-gradient(1100px 500px at 118% -20%, rgba(0, 65, 130, 0.10), transparent 64%),
+                linear-gradient(180deg, #f5f9fd 0%, #edf3fa 42%, #f7fbff 100%);
+            color: var(--text);
         }
+
+        .block-container {
+            max-width: 1280px;
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+        }
+
+        html, body, [class*="css"] {
+            font-family: 'Public Sans', sans-serif;
+            color: var(--text);
+        }
+
+        h1, h2, h3, h4 {
+            font-family: 'Manrope', sans-serif;
+            color: var(--text);
+            letter-spacing: -0.02em;
+        }
+
         .mono {
-            font-family: 'IBM Plex Mono', monospace;
+            font-family: 'JetBrains Mono', monospace;
         }
-        div[data-testid="stStatusWidget"] {
-            border-radius: 0.75rem;
+
+        section[data-testid="stSidebar"] > div {
+            background: linear-gradient(180deg, #ffffff 0%, #f4f8fc 100%);
+            border-right: 1px solid var(--line);
         }
-        div[data-testid="stDataFrame"] {
-            border-radius: 0.65rem;
+
+        .hero-banner {
+            position: relative;
             overflow: hidden;
+            border-radius: 1rem;
+            border: 1px solid var(--line);
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(239, 246, 255, 0.95));
+            padding: 1.15rem 1.3rem;
+            margin-bottom: 1rem;
         }
 
-        @media (prefers-color-scheme: light) {
-            .stApp {
-                background:
-                  radial-gradient(1200px 580px at -5% -15%, rgba(8, 145, 178, 0.14), transparent 65%),
-                  radial-gradient(900px 420px at 105% -15%, rgba(245, 158, 11, 0.12), transparent 60%),
-                  linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
-            }
-            section[data-testid="stSidebar"] > div {
-                background:
-                  linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(241, 245, 249, 0.96));
-                border-right: 1px solid rgba(148, 163, 184, 0.35);
-            }
+        .hero-eyebrow {
+            font-size: 0.73rem;
+            font-family: 'Manrope', sans-serif;
+            letter-spacing: 0.10em;
+            font-weight: 800;
+            text-transform: uppercase;
+            color: var(--brand-strong);
         }
 
-        @media (prefers-color-scheme: dark) {
-            .stApp {
-                background:
-                  radial-gradient(1200px 520px at -5% -20%, rgba(37, 99, 235, 0.25), transparent 65%),
-                  radial-gradient(900px 420px at 105% -10%, rgba(217, 119, 6, 0.20), transparent 60%),
-                  linear-gradient(180deg, #0b1220 0%, #111827 100%);
-            }
-            section[data-testid="stSidebar"] > div {
-                background:
-                  linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.96));
-                border-right: 1px solid rgba(71, 85, 105, 0.45);
-            }
-            .metric-chip {
-                border: 1px solid rgba(148, 163, 184, 0.35);
-                background: rgba(15, 23, 42, 0.72);
-            }
-            div[data-testid="stStatusWidget"] {
-                background: rgba(15, 23, 42, 0.45);
-            }
+        .hero-title {
+            margin: 0.25rem 0 0.35rem 0;
+            font-size: 1.85rem;
+            line-height: 1.1;
+            font-weight: 800;
+            color: var(--text);
         }
+
+        .hero-subtitle {
+            margin: 0;
+            max-width: 780px;
+            color: var(--muted);
+            font-size: 0.97rem;
+            line-height: 1.45;
+        }
+
+        .hero-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 0.8rem;
+        }
+
+        .hero-chip {
+            font-size: 0.76rem;
+            color: var(--text);
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: var(--surface);
+            padding: 0.26rem 0.62rem;
+        }
+
+        .auth-banner {
+            margin-bottom: 0.7rem;
+        }
+
+        .login-shell {
+            border-radius: 1rem;
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1rem 1.1rem;
+            box-shadow: 0 8px 22px rgba(23, 77, 131, 0.09);
+        }
+
+        .metric-chip {
+            margin: 0.4rem 0 0.6rem 0;
+            padding: 0.55rem 0.75rem;
+            border-radius: 0.65rem;
+            border: 1px solid var(--line);
+            background: var(--surface-soft);
+            font-size: 0.91rem;
+            color: var(--text);
+        }
+
+        div[data-testid="stDataFrame"], div[data-testid="stStatusWidget"] {
+            border-radius: 0.78rem;
+            border: 1px solid var(--line);
+            overflow: hidden;
+            background: rgba(255, 255, 255, 0.92);
+        }
+
+        div[data-testid="stMetric"] {
+            border-radius: 0.9rem;
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.88);
+            padding: 0.6rem 0.75rem;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-family: 'Manrope', sans-serif;
+            color: var(--brand-strong);
+            font-weight: 800;
+        }
+
+        div[data-baseweb="tab-list"] {
+            gap: 0.5rem;
+        }
+
+        [data-baseweb="tab"] {
+            border-radius: 0.7rem;
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.85);
+            font-family: 'Public Sans', sans-serif;
+            font-weight: 600;
+            padding: 0.42rem 0.85rem;
+        }
+
+        [data-baseweb="tab-highlight"] {
+            background: var(--brand);
+        }
+
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 0.68rem;
+            border: 1px solid var(--line);
+            font-family: 'Public Sans', sans-serif;
+            font-weight: 600;
+        }
+
+        .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, var(--brand), var(--brand-strong));
+            color: #ffffff;
+            border: 0;
+        }
+
+        .stButton > button[kind="secondary"]:hover {
+            border-color: rgba(10, 102, 194, 0.55);
+            color: var(--brand-strong);
+        }
+
+        .stButton > button[kind="primary"]:hover {
+            background: linear-gradient(180deg, #1d78d6, var(--brand));
+            color: #ffffff;
+        }
+
+        [data-testid="stExpander"] {
+            border-radius: 0.75rem;
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.72);
+        }
+
         @media (max-width: 900px) {
             .block-container {
-                padding-top: 0.8rem;
+                padding-top: 0.9rem;
                 padding-left: 0.75rem;
                 padding-right: 0.75rem;
-                padding-bottom: 1.5rem;
             }
-            h1 {
-                font-size: 1.6rem !important;
+            .hero-title {
+                font-size: 1.45rem;
             }
-            .metric-chip {
-                font-size: 0.82rem;
-                padding: 0.45rem 0.55rem;
-            }
-            div[data-testid="stStatusWidget"] {
-                padding: 0.35rem;
+            .hero-subtitle {
+                font-size: 0.89rem;
             }
         }
         </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def initialize_session_state() -> None:
+    defaults = {
+        "jobs_rows": [],
+        "report_rows": [],
+        "last_query": {},
+        "is_authenticated": False,
+        "active_user": "",
+        "auth_error": "",
+    }
+    for key, default_value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+
+def _resolve_auth_value(key: str, fallback: str) -> str:
+    secret_value = ""
+    try:
+        if key in st.secrets:
+            secret_value = str(st.secrets[key]).strip()
+    except Exception:  # pylint: disable=broad-exception-caught
+        secret_value = ""
+
+    env_value = os.getenv(key, "").strip()
+    return secret_value or env_value or fallback
+
+
+def get_auth_credentials() -> tuple[str, str]:
+    username = _resolve_auth_value("APP_LOGIN_USERNAME", DEFAULT_LOGIN_USERNAME)
+    password = _resolve_auth_value("APP_LOGIN_PASSWORD", DEFAULT_LOGIN_PASSWORD)
+    return username, password
+
+
+def render_login_screen() -> None:
+    st.markdown(
+        """
+        <div class="hero-banner auth-banner">
+            <div class="hero-eyebrow">Secure Workspace</div>
+            <div class="hero-title">Sign In</div>
+            <p class="hero-subtitle">
+                Basic username/password authentication is enabled for this dashboard.
+                After login, you can run multi-source job search and exports.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, center_col, _ = st.columns([1, 1.2, 1])
+    with center_col:
+        st.markdown('<div class="login-shell">', unsafe_allow_html=True)
+        with st.form("login_form"):
+            username = st.text_input("Username", placeholder="Enter username")
+            password = st.text_input("Password", type="password", placeholder="Enter password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+
+        if submitted:
+            expected_username, expected_password = get_auth_credentials()
+            is_valid_username = hmac.compare_digest(username.strip(), expected_username)
+            is_valid_password = hmac.compare_digest(password, expected_password)
+            if is_valid_username and is_valid_password:
+                st.session_state["is_authenticated"] = True
+                st.session_state["active_user"] = username.strip()
+                st.session_state["auth_error"] = ""
+                st.rerun()
+            st.session_state["auth_error"] = "Invalid username or password."
+
+        if st.session_state.get("auth_error"):
+            st.error(st.session_state["auth_error"])
+
+        st.caption("To change credentials, set APP_LOGIN_USERNAME and APP_LOGIN_PASSWORD.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_workspace_header() -> None:
+    safe_user = html.escape(str(st.session_state.get("active_user", "recruiter")))
+    st.markdown(
+        f"""
+        <div class="hero-banner">
+            <div class="hero-eyebrow">Talent Intelligence Workspace</div>
+            <div class="hero-title">Professional Job Intelligence Dashboard</div>
+            <p class="hero-subtitle">
+                Aggregate jobs from multiple boards and career sites, monitor source health,
+                and filter candidates quickly before exporting. Designed with a polished
+                LinkedIn-inspired visual language.
+            </p>
+            <div class="hero-meta">
+                <span class="hero-chip">Signed in: {safe_user}</span>
+                <span class="hero-chip">Streamlit + Pandas</span>
+                <span class="hero-chip">Multi-source search</span>
+            </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -289,12 +512,12 @@ def render_mobile_cards(filtered: pd.DataFrame, max_cards: int = 150) -> None:
             st.caption(location)
             if listed:
                 st.caption(f"Listed: {listed}")
-        if description:
-            st.caption(description)
-        if apply_url:
-            st.markdown(f"[Apply on company site]({apply_url})")
-        if job_url and job_url != apply_url:
-            st.markdown(f"[View job description]({job_url})")
+            if description:
+                st.caption(description)
+            if apply_url:
+                st.markdown(f"[Apply on company site]({apply_url})")
+            if job_url and job_url != apply_url:
+                st.markdown(f"[View job description]({job_url})")
 
 
 def save_to_workspace(df: pd.DataFrame, path_text: str) -> tuple[bool, str]:
@@ -317,21 +540,24 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     inject_styles()
+    initialize_session_state()
 
-    st.title("Job Intelligence Dashboard")
-    st.caption(
-        "Aggregate jobs from multiple boards and career sites, monitor source health, and slice/filter the results before exporting."
-    )
+    if not st.session_state["is_authenticated"]:
+        render_login_screen()
+        st.stop()
 
-    if "jobs_rows" not in st.session_state:
-        st.session_state["jobs_rows"] = []
-    if "report_rows" not in st.session_state:
-        st.session_state["report_rows"] = []
-    if "last_query" not in st.session_state:
-        st.session_state["last_query"] = {}
+    render_workspace_header()
 
     with st.sidebar:
-        st.header("Search")
+        st.header("Search Controls")
+        st.caption(f"Signed in as: {st.session_state.get('active_user', DEFAULT_LOGIN_USERNAME)}")
+        if st.button("Log out", use_container_width=True):
+            st.session_state["is_authenticated"] = False
+            st.session_state["active_user"] = ""
+            st.session_state["auth_error"] = ""
+            st.rerun()
+
+        st.markdown("---")
         keywords = st.text_input("Keywords", value="software engineer")
         location = st.text_input("Location", value="United States")
         limit_per_source = st.slider("Results per source", min_value=5, max_value=120, value=30, step=5)
