@@ -1,76 +1,118 @@
-# Job Intelligence Dashboard (Mac)
+# Jobs Metasearch (Skyscanner-Style)
 
-This project now includes:
+This project is now refactored to a modern product stack:
 
-- a **Streamlit UI** to search across multiple job sources and analyze results
-- the original **LinkedIn CLI exporter** (`linkedin_jobs_to_csv.py`)
+- **Backend**: FastAPI API layer on top of your existing multi-source job engine
+- **Frontend**: React 19 + TypeScript + Vite + React Query
+- **UX direction**: Skyscanner-style journey for jobs (search-first, compare fast, refine with confidence)
+- **Auth**: basic username/password login (session token)
 
-## Best method for your use case
+## Product flow
 
-For local automation on a Mac, the most practical approach is:
+1. Sign in
+2. Run one search across selected sources
+3. See live source health + coverage
+4. Refine with quick filters (text/company/recency/remote/external links)
+5. Open apply links directly from results cards
 
-1. Use public endpoints/APIs where available (stable sources)
-2. Aggregate into one normalized table
-3. Add interactive filters + exports in a local UI
-4. Gracefully handle sources that block bot traffic (Indeed/Naukri can do this)
+## Workspace pages
 
-This is exactly how this implementation is structured.
+- `/search`: query setup, source selection, and advanced source options
+- `/results`: filters + paginated result cards (not one long list)
+- `/sources`: source reliability, run reports, and event timeline
 
-## Setup (macOS)
+## Tech stack
+
+- FastAPI, Uvicorn, Pandas, Requests, BeautifulSoup
+- React 19, TypeScript, Vite, TanStack React Query
+
+## Setup
 
 ```bash
-cd /Users/abhishekpushkarjha/Downloads/linkedin
+cd /Users/abhishekpushkarjha/Desktop/Organized_Files/2026-02\ -\ February\ \(4.09\ GB\)/linkedin
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-## Run the UI
+Frontend dependencies:
 
 ```bash
-streamlit run job_dashboard.py
+cd web
+npm install
 ```
 
-The app provides:
+## Run backend (API)
 
-- source selection (`LinkedIn`, `Indeed`, `Naukri`, `RemoteOK`, `Remotive`, `Arbeitnow`, `Web Search (Company Careers)`)
-- progress/loading status for each provider
-- per-source health report (`success`, `empty`, `blocked`, `error`)
-- advanced filtering ("slice and dice"): text, source, company, location, date, remote, external apply links, employment type, dedupe, sorting
-- JD snippet visibility in result views
-- charts and CSV/JSON download
-- save filtered CSV directly to workspace
-- parallel provider execution for faster runs
-- short-lived in-memory query cache for near-instant repeated searches
-- mobile-friendly layout mode with compact cards
-
-## Source notes
-
-- `LinkedIn`: public guest jobs pages; includes apply-link extraction where available. (UI now defaults to skipping detail-page extraction for speed.)
-- `RemoteOK`, `Remotive`, `Arbeitnow`: public API-style sources.
-- `Indeed`: often protected by anti-bot/captcha. The app surfaces blocked status cleanly.
-- `Naukri`: tries API first; if captcha blocks API, the app falls back to indexed Naukri listing links.
-- `Web Search (Company Careers)`: searches the web for relevant career pages, visits discovered company sites, and extracts job postings by matching title/description and preserving company apply links plus JD snippets.
-
-## CLI still available (LinkedIn CSV)
-
-Interactive:
+From project root:
 
 ```bash
-python3 linkedin_jobs_to_csv.py
+.venv/bin/uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Flags:
+## Run frontend
+
+In a second terminal:
 
 ```bash
-python3 linkedin_jobs_to_csv.py \
-  --keywords "machine learning engineer" \
-  --location "United States" \
-  --limit 30 \
-  --output ml_jobs.csv
+cd web
+npm run dev
 ```
 
-Useful CLI options:
+Open: `http://localhost:5173`
 
-- `--skip-apply-url`: skip detail-page apply extraction (faster, fewer requests).
-- `--detail-delay 0.5`: increase delay between LinkedIn detail requests.
+## Login
+
+Default credentials:
+
+- Username: `recruiter`
+- Password: `linkedin123`
+
+Override with environment variables:
+
+```bash
+export APP_LOGIN_USERNAME="your_username"
+export APP_LOGIN_PASSWORD="your_password"
+```
+
+Optional token/session settings:
+
+```bash
+export APP_TOKEN_TTL_SECONDS=43200
+```
+
+## Publish for alpha testing
+
+### Option A (recommended): Vercel frontend + Render backend
+
+1. Deploy backend (`FastAPI`) as a web service:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
+2. Set backend env vars:
+   - `APP_LOGIN_USERNAME`
+   - `APP_LOGIN_PASSWORD`
+   - `APP_CORS_ORIGINS` (include your frontend URL)
+3. Deploy frontend from `web/`:
+   - Build command: `npm run build`
+   - Output directory: `dist`
+   - Env var: `VITE_API_BASE_URL=https://your-backend-url`
+4. `web/vercel.json` is included so React routes (`/search`, `/results`, `/sources`) rewrite to `index.html`.
+
+### Option B: Railway (frontend + backend as separate services)
+
+- Same env vars and commands as above.
+- Point frontend `VITE_API_BASE_URL` to deployed backend URL.
+
+## API overview
+
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
+- `GET /api/sources`
+- `POST /api/search`
+- `GET /api/health`
+
+## Notes
+
+- Existing source adapters and search logic remain in `job_sources.py`.
+- Streamlit app file is kept for backward compatibility but is no longer the primary UI.
+- Some sources may return blocked/empty depending on anti-bot restrictions or geography.
